@@ -842,7 +842,7 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
         hasher: impl Fn(&T) -> u64,
         mut eq: impl FnMut(&T) -> bool,
     ) -> (Bucket<T>, bool) {
-        let (mut index, found, is_empty) = {
+        let (mut index, found) = {
             self.table
                 .find_potential_inner(hash, &mut |index| eq(self.bucket(index).as_ref()))
         };
@@ -855,16 +855,15 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
         // We can avoid growing the table once we have reached our load
         // factor if we are replacing a tombstone. This works since the
         // number of EMPTY slots does not change in this case.
-        if unlikely(self.table.growth_left == 0 && is_empty) {
+        let old_ctrl = *self.table.ctrl(index);
+        if unlikely(self.table.growth_left == 0 && special_is_empty(old_ctrl)) {
             self.reserve(1, hasher);
             // We simplify the search logic, since we do not
             // have a bucket with equivalent content
             index = self.table.find_insert_slot(hash);
         }
 
-        self.table.growth_left -= usize::from(is_empty);
-        self.table.set_ctrl_h2(index, hash);
-        self.table.items += 1;
+        self.table.record_item_insert_at(index, old_ctrl, hash);
 
         // found = false
         (self.bucket(index), found)
@@ -1194,11 +1193,7 @@ impl<A: Allocator + Clone> RawTableInner<A> {
     /// This uses dynamic dispatch to reduce the amount of code generated, but that is
     /// eliminated by LLVM optimizations.
     #[inline(always)]
-    fn find_potential_inner(
-        &self,
-        hash: u64,
-        eq: &mut dyn FnMut(usize) -> bool,
-    ) -> (usize, bool, bool) {
+    fn find_potential_inner(&self, hash: u64, eq: &mut dyn FnMut(usize) -> bool) -> (usize, bool) {
         let h2_hash = h2(hash);
         let mut probe_seq = self.probe_seq(hash);
         let mut group_insert = unsafe { Group::load(self.ctrl(probe_seq.pos)) };
@@ -1208,7 +1203,7 @@ impl<A: Allocator + Clone> RawTableInner<A> {
                 let index = (probe_seq.pos + bit) & self.bucket_mask;
 
                 if likely(eq(index)) {
-                    return (index, true, false);
+                    return (index, true);
                 }
             }
 
@@ -1224,8 +1219,7 @@ impl<A: Allocator + Clone> RawTableInner<A> {
             // We didn't find the element we were looking for in the group, try to get an
             // insertion slot from the group if we don't have one yet.
             if let Some(bit) = group_insert.match_empty_or_deleted().lowest_set_bit() {
-                let result = (probe_seq.pos + bit) & self.bucket_mask;
-                break result;
+                break (probe_seq.pos + bit) & self.bucket_mask;
             }
             probe_seq.move_next(self.bucket_mask);
             group_insert = unsafe { Group::load(self.ctrl(probe_seq.pos)) };
@@ -1241,18 +1235,17 @@ impl<A: Allocator + Clone> RawTableInner<A> {
         // slot (due to the load factor) before hitting the trailing
         // control bytes (containing EMPTY).
         unsafe {
-            let control_byte = *self.ctrl(index);
-            if unlikely(is_full(control_byte)) {
+            if unlikely(self.is_bucket_full(index)) {
                 debug_assert!(self.bucket_mask < Group::WIDTH);
                 debug_assert_ne!(probe_seq.pos, 0);
-                let index = Group::load_aligned(self.ctrl(0))
-                    .match_empty_or_deleted()
-                    .lowest_set_bit_nonzero();
-                debug_assert!(special_is_empty(*self.ctrl(index)));
-                return (index, false, true);
+                return (
+                    Group::load_aligned(self.ctrl(0))
+                        .match_empty_or_deleted()
+                        .lowest_set_bit_nonzero(),
+                    false,
+                );
             }
-
-            return (index, false, special_is_empty(control_byte));
+            return (index, false);
         }
     }
 
