@@ -1254,51 +1254,6 @@ impl<A: Allocator + Clone> RawTableInner<A> {
 
             return (index, false, special_is_empty(control_byte));
         }
-        // let h2_hash = h2(hash);
-        // let mut probe_seq = self.probe_seq(hash);
-
-        // loop {
-        //     let group = unsafe { Group::load(self.ctrl(probe_seq.pos)) };
-
-        //     for bit in group.match_byte(h2_hash) {
-        //         let index = (probe_seq.pos + bit) & self.bucket_mask;
-
-        //         if likely(eq(index)) {
-        //             return (index, true, false);
-        //         }
-        //     }
-
-        //     // We didn't find the element we were looking for in the group, try to get an
-        //     // insertion slot from the group if we don't have one yet.
-        //     if let Some(bit) = group.match_empty_or_deleted().lowest_set_bit() {
-        //         let result = (probe_seq.pos + bit) & self.bucket_mask;
-
-        //         // In tables smaller than the group width, trailing control
-        //         // bytes outside the range of the table are filled with
-        //         // EMPTY entries. These will unfortunately trigger a
-        //         // match, but once masked may point to a full bucket that
-        //         // is already occupied. We detect this situation here and
-        //         // perform a second scan starting at the beginning of the
-        //         // table. This second scan is guaranteed to find an empty
-        //         // slot (due to the load factor) before hitting the trailing
-        //         // control bytes (containing EMPTY).
-        //         unsafe {
-        //             let control_byte = *self.ctrl(result);
-        //             if unlikely(is_full(control_byte)) {
-        //                 debug_assert!(self.bucket_mask < Group::WIDTH);
-        //                 debug_assert_ne!(probe_seq.pos, 0);
-        //                 let result = Group::load_aligned(self.ctrl(0))
-        //                     .match_empty_or_deleted()
-        //                     .lowest_set_bit_nonzero();
-        //                 debug_assert!(special_is_empty(*self.ctrl(result)));
-        //                 return (result, false, true);
-        //             }
-
-        //             return (result, false, special_is_empty(control_byte));
-        //         }
-        //     }
-        //     probe_seq.move_next(self.bucket_mask);
-        // }
     }
 
     /// Searches for an empty or deleted bucket which is suitable for inserting
