@@ -1793,7 +1793,9 @@ impl<A: Allocator + Clone> RawTableInner<A> {
         // Note that in this context `leading_zeros` refers to the bytes at the
         // end of a group, while `trailing_zeros` refers to the bytes at the
         // beginning of a group.
-        let ctrl = if empty_before.leading_zeros() + empty_after.trailing_zeros() >= Group::WIDTH {
+        let ctrl = if empty_before.leading_zeros() + empty_after.trailing_zeros()
+            > Group::ONE_LESS_WIDTH
+        {
             DELETED
         } else {
             self.growth_left += 1;

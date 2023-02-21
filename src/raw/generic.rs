@@ -47,6 +47,7 @@ pub(crate) struct Group(GroupWord);
 impl Group {
     /// Number of bytes in the group.
     pub(crate) const WIDTH: usize = mem::size_of::<Self>();
+    pub(crate) const ONE_LESS_WIDTH: usize = mem::size_of::<Self>() - 1;
 
     /// Returns a full group of empty bytes, suitable for use as the initial
     /// value for an empty hash table.
