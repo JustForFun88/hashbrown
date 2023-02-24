@@ -1196,29 +1196,22 @@ impl<A: Allocator + Clone> RawTableInner<A> {
     fn find_potential_inner(&self, hash: u64, eq: &mut dyn FnMut(usize) -> bool) -> (usize, bool) {
         let h2_hash = h2(hash);
         let mut probe_seq = self.probe_seq(hash);
-        let mut group_insert = unsafe { Group::load(self.ctrl(probe_seq.pos)) };
-        let mut group_find = group_insert;
-        loop {
-            for bit in group_find.match_byte(h2_hash) {
-                let index = (probe_seq.pos + bit) & self.bucket_mask;
 
-                if likely(eq(index)) {
-                    return (index, true);
+        let mut found_empty_or_deleted_slot = false;
+        let mut outer_index = 0;
+        loop {
+            let group = unsafe { Group::load(self.ctrl(probe_seq.pos)) };
+            for bit in group.match_byte(h2_hash) {
+                let inner_index = (probe_seq.pos + bit) & self.bucket_mask;
+
+                if likely(eq(inner_index)) {
+                    return (inner_index, true);
                 }
             }
 
-            if likely(group_find.match_empty().any_bit_set()) {
-                break;
-            }
-
-            probe_seq.move_next(self.bucket_mask);
-            group_find = unsafe { Group::load(self.ctrl(probe_seq.pos)) };
-        }
-        let mut probe_seq = self.probe_seq(hash);
-        loop {
-            unsafe {
-                if let Some(bit) = group_insert.match_empty_or_deleted().lowest_set_bit() {
-                    let index = (probe_seq.pos + bit) & self.bucket_mask;
+            if likely(!found_empty_or_deleted_slot) {
+                if let Some(bit) = group.match_empty_or_deleted().lowest_set_bit() {
+                    outer_index = (probe_seq.pos + bit) & self.bucket_mask;
 
                     // In tables smaller than the group width, trailing control
                     // bytes outside the range of the table are filled with
@@ -1229,24 +1222,87 @@ impl<A: Allocator + Clone> RawTableInner<A> {
                     // table. This second scan is guaranteed to find an empty
                     // slot (due to the load factor) before hitting the trailing
                     // control bytes (containing EMPTY).
-                    if unlikely(self.is_bucket_full(index)) {
-                        debug_assert!(self.bucket_mask < Group::WIDTH);
-                        debug_assert_ne!(probe_seq.pos, 0);
-                        return (
-                            Group::load_aligned(self.ctrl(0))
+                    unsafe {
+                        if unlikely(self.is_bucket_full(outer_index)) {
+                            debug_assert!(self.bucket_mask < Group::WIDTH);
+                            debug_assert_ne!(probe_seq.pos, 0);
+                            outer_index = Group::load_aligned(self.ctrl(0))
                                 .match_empty_or_deleted()
-                                .lowest_set_bit_nonzero(),
-                            false,
-                        );
+                                .lowest_set_bit_nonzero();
+                        }
                     }
-
-                    return (index, false);
+                    found_empty_or_deleted_slot = true;
                 }
-                probe_seq.move_next(self.bucket_mask);
-                group_insert = Group::load(self.ctrl(probe_seq.pos));
             }
+
+            if likely(group.match_empty().any_bit_set()) {
+                return (outer_index, false);
+            }
+
+            probe_seq.move_next(self.bucket_mask);
         }
     }
+
+    // /// Searches for an element in the table, or a potential slot where that element could be
+    // /// inserted.
+    // ///
+    // /// This uses dynamic dispatch to reduce the amount of code generated, but that is
+    // /// eliminated by LLVM optimizations.
+    // #[inline(always)]
+    // fn find_potential_inner(&self, hash: u64, eq: &mut dyn FnMut(usize) -> bool) -> (usize, bool) {
+    //     let h2_hash = h2(hash);
+    //     let mut probe_seq = self.probe_seq(hash);
+    //     let mut group_insert = unsafe { Group::load(self.ctrl(probe_seq.pos)) };
+    //     let mut group_find = group_insert;
+    //     loop {
+    //         for bit in group_find.match_byte(h2_hash) {
+    //             let index = (probe_seq.pos + bit) & self.bucket_mask;
+
+    //             if likely(eq(index)) {
+    //                 return (index, true);
+    //             }
+    //         }
+
+    //         if likely(group_find.match_empty().any_bit_set()) {
+    //             break;
+    //         }
+
+    //         probe_seq.move_next(self.bucket_mask);
+    //         group_find = unsafe { Group::load(self.ctrl(probe_seq.pos)) };
+    //     }
+    //     let mut probe_seq = self.probe_seq(hash);
+    //     loop {
+    //         unsafe {
+    //             if let Some(bit) = group_insert.match_empty_or_deleted().lowest_set_bit() {
+    //                 let index = (probe_seq.pos + bit) & self.bucket_mask;
+
+    //                 // In tables smaller than the group width, trailing control
+    //                 // bytes outside the range of the table are filled with
+    //                 // EMPTY entries. These will unfortunately trigger a
+    //                 // match, but once masked may point to a full bucket that
+    //                 // is already occupied. We detect this situation here and
+    //                 // perform a second scan starting at the beginning of the
+    //                 // table. This second scan is guaranteed to find an empty
+    //                 // slot (due to the load factor) before hitting the trailing
+    //                 // control bytes (containing EMPTY).
+    //                 if unlikely(self.is_bucket_full(index)) {
+    //                     debug_assert!(self.bucket_mask < Group::WIDTH);
+    //                     debug_assert_ne!(probe_seq.pos, 0);
+    //                     return (
+    //                         Group::load_aligned(self.ctrl(0))
+    //                             .match_empty_or_deleted()
+    //                             .lowest_set_bit_nonzero(),
+    //                         false,
+    //                     );
+    //                 }
+
+    //                 return (index, false);
+    //             }
+    //             probe_seq.move_next(self.bucket_mask);
+    //             group_insert = Group::load(self.ctrl(probe_seq.pos));
+    //         }
+    //     }
+    // }
 
     /// Searches for an empty or deleted bucket which is suitable for inserting
     /// a new element.
