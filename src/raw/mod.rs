@@ -40,6 +40,10 @@ mod bitmask;
 use self::bitmask::{BitMask, BitMaskIter};
 use self::imp::Group;
 
+mod array;
+use self::array::ArrayGuard;
+pub use self::array::ArrayIter;
+
 // Branch prediction hint. This is currently only available on nightly but it
 // consistently improves performance by 10-15%.
 #[cfg(feature = "nightly")]
@@ -1272,6 +1276,64 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
             Some(bucket) => Some(unsafe { bucket.as_mut() }),
             None => None,
         }
+    }
+
+    /// Attempts to get mutable references to `N` entries in the table at once using
+    /// `hash` and equality function from iterator.
+    ///
+    /// Returns an [`ArrayIter`] of length `N` with the results of each query.
+    ///
+    /// At most one mutable reference will be returned to any entry.
+    /// Duplicate values will be skipped.
+    ///
+    /// The `iter` argument should be an iterator that return `hash` of the stored
+    /// `element` and closure for checking the equivalence of that `element`.
+    pub fn try_get_many_mut<'a, I, F, const N: usize>(
+        &'a mut self,
+        iter: &mut I,
+    ) -> ArrayIter<&'a mut T, N>
+    where
+        I: Iterator<Item = (u64, F)>,
+        F: FnMut(&T) -> bool,
+    {
+        if N == 0 {
+            // SAFETY: An empty array is always inhabited and has no validity invariants.
+            return ArrayGuard::<&mut T, N>::new().into_iter();
+        }
+
+        let mut guard = ArrayGuard::<*mut T, N>::new();
+
+        for (hash, eq) in iter {
+            if let Some(cur) = self.find(hash, eq) {
+                // SAFETY: hashes length is equal to `array` length
+                unsafe { guard.push_unchecked(cur.as_ptr()) }
+            }
+        }
+
+        let mut into_iter = guard.into_iter();
+        into_iter.as_mut_slice().sort_unstable();
+
+        let mut guard = ArrayGuard::<&mut T, N>::new();
+
+        if let Some(mut cur_ptr) = into_iter.next() {
+            // SAFETY:
+            // 1. `N` is greater than 0, which was checked above
+            // 2. One pointer is always unique.
+            // 3. We got all the pointers from the `find` function, so they are valid.
+            unsafe { guard.push_unchecked(&mut *cur_ptr) };
+
+            for next_ptr in into_iter {
+                if !ptr::eq(cur_ptr, next_ptr) {
+                    // SAFETY:
+                    // 1. The `into_iter` length is equal or less than `guard` length
+                    // 2. We have just verified that this is a unique pointer that does not repeat within the array.
+                    // 3. We got all the pointers from the `find` function, so they are valid.
+                    unsafe { guard.push_unchecked(&mut *next_ptr) };
+                    cur_ptr = next_ptr;
+                }
+            }
+        }
+        guard.into_iter()
     }
 
     /// Attempts to get mutable references to `N` entries in the table at once.
