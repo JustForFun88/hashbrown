@@ -32,7 +32,9 @@ impl<T> Clone for RawParIter<T> {
 
 impl<T> From<RawIter<T>> for RawParIter<T> {
     fn from(it: RawIter<T>) -> Self {
-        RawParIter { iter: it.iter }
+        RawParIter {
+            iter: From::from(it),
+        }
     }
 }
 
@@ -94,7 +96,7 @@ impl<T: Send, A: Allocator + Clone + Send> ParallelIterator for RawIntoParIter<T
     where
         C: UnindexedConsumer<Self::Item>,
     {
-        let iter = unsafe { self.table.iter().iter };
+        let iter = unsafe { self.table.raw_iter_range() };
         let _guard = guard(self.table.into_allocation(), |alloc| {
             if let Some((ptr, layout, ref alloc)) = *alloc {
                 unsafe {
@@ -135,7 +137,7 @@ impl<T: Send, A: Allocator + Clone> ParallelIterator for RawParDrain<'_, T, A> {
         let _guard = guard(self.table, |table| unsafe {
             table.as_mut().clear_no_drop();
         });
-        let iter = unsafe { self.table.as_ref().iter().iter };
+        let iter = unsafe { self.table.as_ref().raw_iter_range() };
         mem::forget(self);
         let producer = ParDrainProducer { iter };
         plumbing::bridge_unindexed(producer, consumer)
@@ -208,7 +210,7 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     pub unsafe fn par_iter(&self) -> RawParIter<T> {
         RawParIter {
-            iter: self.iter().iter,
+            iter: self.raw_iter_range(),
         }
     }
 

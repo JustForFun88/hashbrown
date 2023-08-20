@@ -1445,11 +1445,21 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
     /// struct, we have to make the `iter` method unsafe.
     #[inline]
     pub unsafe fn iter(&self) -> RawIter<T> {
-        let data = Bucket::from_base_index(self.data_end(), 0);
         RawIter {
-            iter: RawIterRange::new(self.table.ctrl.as_ptr(), data, self.table.buckets()),
-            items: self.table.items,
+            iter: self.table.full_buckets_indices(),
+            data: PhantomData,
         }
+    }
+
+    /// Returns an iterator over every element in the table. It is up to
+    /// the caller to ensure that the `RawIterRange` outlives the `RawIter`.
+    /// Because we cannot make the `next` method unsafe on the `RawIterRange`
+    /// struct, we have to make the `raw_iter_range` method unsafe.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) unsafe fn raw_iter_range(&self) -> RawIterRange<T> {
+        let data = Bucket::from_base_index(self.data_end(), 0);
+        RawIterRange::new(self.table.ctrl.as_ptr(), data, self.table.buckets())
     }
 
     /// Returns an iterator over occupied buckets that could match a given hash.
@@ -2315,12 +2325,14 @@ impl<A: Allocator + Clone> RawTableInner<A> {
     #[inline(always)]
     unsafe fn full_buckets_indices(&self) -> FullBucketsIndices {
         // SAFETY:
-        // 1. The first `self.ctrl` pointed to the start of the array of control
+        // 1. The `self.data_end()` pointed to the start of the array of control
         //    bytes, and therefore: `ctrl` is valid for reads, properly aligned
         //    to `Group::WIDTH` and points to the properly initialized control
         //    bytes.
-        // 2. The value of `items` is equal to the amount of data (values) added
+        // 2. `group_first_index` is equal to the `ctrl` index (i.e. equal to zero).
+        // 3. The value of `items` is equal to the amount of data (values) added
         //    to the table.
+        // 4. We pass the exact value of buckets of the table to the function.
         //
         //                         `ctrl` points here (to the start
         //                         of the first control byte `CT0`)
@@ -2332,16 +2344,7 @@ impl<A: Allocator + Clone> RawTableInner<A> {
         //
         // where: T0...T_n  - our stored data;
         //        CT0...CT_n - control bytes or metadata for `data`.
-        let ctrl = NonNull::new_unchecked(self.ctrl(0));
-
-        FullBucketsIndices {
-            // Load the first group
-            // SAFETY: See explanation above.
-            current_group: Group::load_aligned(ctrl.as_ptr()).match_full().into_iter(),
-            group_first_index: 0,
-            ctrl,
-            items: self.items,
-        }
+        FullBucketsIndices::new(self.data_end(), 0, self.items, self.buckets())
     }
 
     /// Allocates a new table of a different size and moves the contents of the
@@ -2862,10 +2865,9 @@ impl<T: Clone, A: Allocator + Clone> RawTable<T, A> {
             }
         });
 
-        for from in source.iter() {
-            let index = source.bucket_index(&from);
+        for index in source.table.full_buckets_indices() {
             let to = guard.1.bucket(index);
-            to.write(from.as_ref().clone());
+            to.write(source.bucket(index).as_ref().clone());
 
             // Update the index in case we need to unwind.
             guard.0 = index;
@@ -3122,6 +3124,24 @@ impl<T> Iterator for RawIterRange<T> {
 
 impl<T> FusedIterator for RawIterRange<T> {}
 
+impl<T> From<RawIter<T>> for RawIterRange<T> {
+    #[inline(always)]
+    fn from(iter: RawIter<T>) -> Self {
+        let RawIter { iter, .. } = iter;
+        unsafe {
+            RawIterRange {
+                current_group: iter.current_group,
+                data: Bucket::<T>::from_base_index(iter.ctrl.cast(), iter.group_first_index),
+                next_ctrl: iter
+                    .ctrl
+                    .as_ptr()
+                    .add(iter.group_first_index + Group::WIDTH),
+                end: iter.ctrl.as_ptr().add(iter.buckets),
+            }
+        }
+    }
+}
+
 /// Iterator which returns a raw pointer to every full bucket in the table.
 ///
 /// For maximum flexibility this iterator is not bound by a lifetime, but you
@@ -3135,8 +3155,8 @@ impl<T> FusedIterator for RawIterRange<T> {}
 /// - The order in which the iterator yields bucket is unspecified and may
 ///   change in the future.
 pub struct RawIter<T> {
-    pub(crate) iter: RawIterRange<T>,
-    items: usize,
+    iter: FullBucketsIndices,
+    data: PhantomData<*const T>,
 }
 
 impl<T> RawIter<T> {
@@ -3151,7 +3171,7 @@ impl<T> RawIter<T> {
     /// method if you are removing an item that this iterator yielded in the past.
     #[cfg(feature = "raw")]
     pub unsafe fn reflect_remove(&mut self, b: &Bucket<T>) {
-        self.reflect_toggle_full(b, false);
+        self.reflect_toggle_full::<false>(b);
     }
 
     /// Refresh the iterator so that it reflects an insertion into the given bucket.
@@ -3165,39 +3185,39 @@ impl<T> RawIter<T> {
     /// This method should be called _after_ the given insert is made.
     #[cfg(feature = "raw")]
     pub unsafe fn reflect_insert(&mut self, b: &Bucket<T>) {
-        self.reflect_toggle_full(b, true);
+        self.reflect_toggle_full::<true>(b);
     }
 
     /// Refresh the iterator so that it reflects a change to the state of the given bucket.
     #[cfg(feature = "raw")]
-    unsafe fn reflect_toggle_full(&mut self, b: &Bucket<T>, is_insert: bool) {
-        if b.as_ptr() > self.iter.data.as_ptr() {
+    unsafe fn reflect_toggle_full<const IS_INSERT: bool>(&mut self, b: &Bucket<T>) {
+        if b.to_base_index(self.iter.ctrl.cast()) < self.iter.group_first_index {
             // The iterator has already passed the bucket's group.
             // So the toggle isn't relevant to this iterator.
             return;
         }
 
-        if self.iter.next_ctrl < self.iter.end
-            && b.as_ptr() <= self.iter.data.next_n(Group::WIDTH).as_ptr()
+        if self.iter.group_first_index + Group::WIDTH < self.iter.buckets
+            && b.to_base_index(self.iter.ctrl.cast()) >= self.iter.group_first_index + Group::WIDTH
         {
             // The iterator has not yet reached the bucket's group.
             // We don't need to reload anything, but we do need to adjust the item count.
-
             if cfg!(debug_assertions) {
                 // Double-check that the user isn't lying to us by checking the bucket state.
-                // To do that, we need to find its control byte. We know that self.iter.data is
-                // at self.iter.next_ctrl - Group::WIDTH, so we work from there:
-                let offset = offset_from(self.iter.data.as_ptr(), b.as_ptr());
-                let ctrl = self.iter.next_ctrl.sub(Group::WIDTH).add(offset);
                 // This method should be called _before_ a removal, or _after_ an insert,
                 // so in both cases the ctrl byte should indicate that the bucket is full.
+                let ctrl = self
+                    .iter
+                    .ctrl
+                    .as_ptr()
+                    .add(b.to_base_index(self.iter.ctrl.cast()));
                 assert!(is_full(*ctrl));
             }
 
-            if is_insert {
-                self.items += 1;
+            if IS_INSERT {
+                self.iter.items += 1;
             } else {
-                self.items -= 1;
+                self.iter.items -= 1;
             }
 
             return;
@@ -3212,8 +3232,8 @@ impl<T> RawIter<T> {
         //    yield a to-be-removed bucket, or _will_ yield a to-be-added bucket.
         //    We'll also need to update the item count accordingly.
         if let Some(index) = self.iter.current_group.0.lowest_set_bit() {
-            let next_bucket = self.iter.data.next_n(index);
-            if b.as_ptr() > next_bucket.as_ptr() {
+            let next_bucket_index = self.iter.group_first_index + index;
+            if b.to_base_index(self.iter.ctrl.cast()) < next_bucket_index {
                 // The toggled bucket is "before" the bucket the iterator would yield next. We
                 // therefore don't need to do anything --- the iterator has already passed the
                 // bucket in question.
@@ -3231,18 +3251,19 @@ impl<T> RawIter<T> {
                 // call to reflect for those buckets might _also_ decrement the item count.
                 // Instead, we _just_ flip the bit for the particular bucket the caller asked
                 // us to reflect.
-                let our_bit = offset_from(self.iter.data.as_ptr(), b.as_ptr());
+                let bucket_index = b.to_base_index(self.iter.ctrl.cast());
+                let our_bit = bucket_index - self.iter.group_first_index;
                 let was_full = self.iter.current_group.flip(our_bit);
-                debug_assert_ne!(was_full, is_insert);
+                debug_assert_ne!(was_full, IS_INSERT);
 
-                if is_insert {
-                    self.items += 1;
+                if IS_INSERT {
+                    self.iter.items += 1;
                 } else {
-                    self.items -= 1;
+                    self.iter.items -= 1;
                 }
 
                 if cfg!(debug_assertions) {
-                    if b.as_ptr() == next_bucket.as_ptr() {
+                    if b.to_base_index(self.iter.ctrl.cast()) == next_bucket_index {
                         // The removed bucket should no longer be next
                         debug_assert_ne!(self.iter.current_group.0.lowest_set_bit(), Some(index));
                     } else {
@@ -3270,7 +3291,7 @@ impl<T> Clone for RawIter<T> {
     fn clone(&self) -> Self {
         Self {
             iter: self.iter.clone(),
-            items: self.items,
+            data: PhantomData,
         }
     }
 }
@@ -3280,26 +3301,18 @@ impl<T> Iterator for RawIter<T> {
 
     #[cfg_attr(feature = "inline-more", inline)]
     fn next(&mut self) -> Option<Bucket<T>> {
-        // Inner iterator iterates over buckets
-        // so it can do unnecessary work if we already yielded all items.
-        if self.items == 0 {
-            return None;
+        unsafe {
+            // SAFETY: The caller ensures that the table is alive and has not moved.
+            match self.iter.next() {
+                Some(index) => Some(Bucket::<T>::from_base_index(self.iter.ctrl.cast(), index)),
+                None => None,
+            }
         }
-
-        let nxt = unsafe {
-            // SAFETY: We check number of items to yield using `items` field.
-            self.iter.next_impl::<false>()
-        };
-
-        debug_assert!(nxt.is_some());
-        self.items -= 1;
-
-        nxt
     }
 
-    #[inline]
+    #[inline(always)]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.items, Some(self.items))
+        self.iter.size_hint()
     }
 }
 
@@ -3319,6 +3332,19 @@ impl<T> FusedIterator for RawIter<T> {}
 /// - The order in which the iterator yields indices of the buckets is unspecified
 ///   and may change in the future.
 pub(crate) struct FullBucketsIndices {
+    // If a given subset of a table is equal to the table itself, then:
+    //
+    //             `ctrl` points here (to the start
+    //             of the first control byte `CT0`)
+    //                          ∨
+    // [Pad], T_n, ..., T1, T0, |CT0, CT1, ..., CT_n|, Group::WIDTH
+    //                           \________  ________/
+    //                                    \/
+    //       `n = buckets - 1`, i.e. `RawIndexTableInner::buckets() - 1`
+    //
+    // where: T0...T_n  - our stored data;
+    //        CT0...CT_n - control bytes or metadata for `data`.
+
     // Mask of full buckets in the current group. Bits are cleared from this
     // mask as each element is processed.
     current_group: BitMaskIter,
@@ -3328,25 +3354,76 @@ pub(crate) struct FullBucketsIndices {
     group_first_index: usize,
 
     // Pointer to the current group of control bytes,
-    // Must be aligned to the group size (Group::WIDTH).
+    // Must be aligned to the group size (Group::WIDTH)
+    // and must not be changed during iteration.
     ctrl: NonNull<u8>,
 
-    // Number of elements in the table.
+    // Buckets number in given subset of a table.
+    buckets: usize,
+
+    // Number of elements in given subset of a table.
     items: usize,
 }
 
+impl Clone for FullBucketsIndices {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            current_group: self.current_group,
+            group_first_index: self.group_first_index,
+            ctrl: self.ctrl,
+            buckets: self.buckets,
+            items: self.items,
+        }
+    }
+}
+
 impl FullBucketsIndices {
+    /// Returns a `FullBucketsIndices` covering a subset of a table.
+    ///
+    /// # Safety
+    ///
+    /// If any of the following conditions are violated, the result is Undefined
+    /// Behavior:
+    ///
+    /// * `ctrl` must be [valid] for reads, i.e. table outlives the `FullBucketsIndices`;
+    ///
+    /// * `ctrl` must be properly aligned to the group size (Group::WIDTH);
+    ///
+    /// * `ctrl` must point to the array of properly initialized control bytes;
+    ///
+    /// * `ctrl_index` must be equal to the `ctrl` index in the table;
+    ///
+    /// * the value of `items` should be equal to the amount of `FULL` buckets between
+    ///   `ctrl.as_ptr().add(buckets)` and `ctrl.as_ptr()`;
+    ///
+    /// * the value of `buckets` must be less than or equal to the number of table buckets,
+    ///   and the returned value of `ctrl.as_ptr().add(buckets).offset_from(ctrl.as_ptr())`
+    ///   must be positive.
+    ///
+    /// * The `buckets` must be a power of two.
+    #[inline]
+    unsafe fn new(ctrl: NonNull<u8>, ctrl_index: usize, items: usize, buckets: usize) -> Self {
+        debug_assert_ne!(buckets, 0);
+        debug_assert_eq!(ctrl.as_ptr() as usize % Group::WIDTH, 0);
+        debug_assert!(buckets.is_power_of_two());
+        Self {
+            // Load the first group
+            current_group: Group::load_aligned(ctrl.as_ptr()).match_full().into_iter(),
+            group_first_index: ctrl_index,
+            ctrl,
+            items,
+            buckets,
+        }
+    }
+
     /// Advances the iterator and returns the next value.
     ///
     /// # Safety
     ///
-    /// If any of the following conditions are violated, the result is
-    /// [`Undefined Behavior`]:
-    ///
-    /// * The [`RawTableInner`] / [`RawTable`] must be alive and not moved,
-    ///   i.e. table outlives the `FullBucketsIndices`;
-    ///
-    /// * It never tries to iterate after getting all elements.
+    /// The [`RawTableInner`] / [`RawTable`] must be alive and not moved,
+    /// i.e. table outlives the `FullBucketsIndices`, otherwise calling
+    /// this function may result in [`Undefined Behavior`]:
     ///
     /// [`Undefined Behavior`]: https://doc.rust-lang.org/reference/behavior-considered-undefined.html
     #[inline(always)]
@@ -3360,9 +3437,8 @@ impl FullBucketsIndices {
 
             // SAFETY: The caller of this function ensures that:
             //
-            // 1. It never tries to iterate after getting all the elements;
-            // 2. The table is alive and did not moved;
-            // 3. The first `self.ctrl` pointed to the start of the array of control bytes.
+            // 1. The table is alive and did not moved;
+            // 2. The first `self.ctrl` pointed to the start of the array of control bytes.
             //
             // Taking the above into account, we always stay within the bounds, because:
             //
@@ -3374,18 +3450,18 @@ impl FullBucketsIndices {
             //    power of two (2 ^ n), Group::WIDTH is also power of two (2 ^ k). Sinse
             //    `(2 ^ n) > (2 ^ k)`, than `(2 ^ n) % (2 ^ k) = 0`. As we start from the
             //    the start of the array of control bytes, and never try to iterate after
-            //    getting all the elements, the last `self.ctrl` will be equal to
-            //    the `self.buckets() - Group::WIDTH`, so `self.current_group.next()`
-            //    will always contains bytes within the table range (0..self.buckets()),
+            //    getting all the elements, the last `self.group_first_index` will be equal
+            //    to the `self.buckets() - Group::WIDTH`, so `self.current_group.next()`
+            //    will always contains bytes within the table range (0..Group::WIDTH),
             //    and subsequent `self.group_first_index + index` will always return a
             //    number less than `self.buckets()`.
-            self.ctrl = NonNull::new_unchecked(self.ctrl.as_ptr().add(Group::WIDTH));
 
-            // SAFETY: See explanation above.
-            self.current_group = Group::load_aligned(self.ctrl.as_ptr())
-                .match_full()
-                .into_iter();
             self.group_first_index += Group::WIDTH;
+            // SAFETY: See explanation above.
+            self.current_group =
+                Group::load_aligned(self.ctrl.as_ptr().add(self.group_first_index))
+                    .match_full()
+                    .into_iter();
         }
     }
 }
@@ -3402,18 +3478,11 @@ impl Iterator for FullBucketsIndices {
         if self.items == 0 {
             return None;
         }
-
-        let nxt = unsafe {
-            // SAFETY:
-            // 1. We check number of items to yield using `items` field.
-            // 2. The caller ensures that the table is alive and has not moved.
-            self.next_impl()
-        };
-
-        debug_assert!(nxt.is_some());
         self.items -= 1;
-
-        nxt
+        unsafe {
+            // SAFETY: The caller ensures that the table is alive and has not moved.
+            self.next_impl()
+        }
     }
 
     #[inline(always)]
